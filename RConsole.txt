@@ -1,0 +1,1136 @@
+> # ============================================================
+> # DLI (Decisive Language Intensity) + Households (Michigan Survey) + Professionals (SPF)
+> # Quarterly pipeline + HAC/Newey-West inference + figures + heterogeneity test
+> #
+> # One-shot script:
+> #  (1) Read FOMC HTML statements -> compute DLI (daily)
+> #  (2) Aggregate DLI to quarterly (mean + last-in-quarter)
+> #  (3) Aggregate household monthly inflation expectations (Michigan Survey) to quarterly
+> #  (4) Read professional quarterly expectations (SPF)  <== from your "philadelphiafed" file
+> #  (5) Read FOMC surprises (2020+) -> quarterly aggregation
+> #  (6) Merge quarterly panel + derived vars (lags, deltas)
+> #  (7) Baseline regressions (NW/HAC) + exports
+> #  (8) Surprise-augmented regressions (post-2020) + exports
+> #  (9) Figures (publication-ready) + exports
+> # (10) OPTIONAL: DLI shock (cleanly separated)
+> # (11) Mechanism validation via heterogeneity (households vs professionals) + exports + figure
+> # ============================================================
+> 
+> options(repos = c(CRAN = "https://cloud.r-project.org"))
+> 
+> # ---------- Packages ----------
+> pkgs <- c(
++   "tidyverse", "stringr", "lubridate",
++   "xml2", "rvest",
++   "quanteda", "readr",
++   "readxl", "janitor",
++   "sandwich", "broom", "scales"
++ )
+> 
+> to_install <- pkgs[!pkgs %in% installed.packages()[, "Package"]]
+> if (length(to_install) > 0) install.packages(to_install, dependencies = TRUE)
+> 
+> suppressPackageStartupMessages({
++   library(tidyverse)
++   library(stringr)
++   library(lubridate)
++   library(xml2)
++   library(rvest)
++   library(quanteda)
++   library(readr)
++   library(readxl)
++   library(janitor)
++   library(sandwich)
++   library(broom)
++   library(scales)
++ })
+> 
+> # ============================================================
+> # USER PATHS (EDIT HERE)
+> # ============================================================
+> BASE_DIR <- "C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper"
+> STATEMENTS_DIR <- file.path(BASE_DIR, "fomc_statements_html")
+> 
+> # Households (Michigan Survey) - monthly -> quarterly
+> MICHIGAN_XLSX <- file.path(BASE_DIR, "sca-table32-on-2025-Dec-18.tsv - michigan mensal mean.xlsx")
+> 
+> # SPF (professionals) - quarterly (YOUR FILE; despite name mentioning philadelphiafed)
+> # Columns expected after clean_names(): year, quarter, cpi1
+> SPF_XLSX <- file.path(BASE_DIR, "Mean_CPI_Level_ philadelphiafed trimestral mean.xlsx")
+> 
+> # FOMC surprises (event-level) -> quarterly sums
+> FOMC_SURPRISES_CSV <- file.path(BASE_DIR, "fomc_surprises.csv")
+> 
+> # ---------- Outputs ----------
+> OUT_DLI_DAILY_CSV         <- file.path(BASE_DIR, "fomc_dli_daily.csv")
+> OUT_DLI_QUARTERLY_CSV     <- file.path(BASE_DIR, "fomc_dli_quarterly.csv")
+> OUT_SURPRISES_Q_CSV       <- file.path(BASE_DIR, "fomc_surprises_quarterly.csv")
+> 
+> OUT_PANEL_QUARTERLY       <- file.path(BASE_DIR, "panel_quarterly_dli_michigan_spf.csv")
+> 
+> OUT_REG_RESULTS_CSV       <- file.path(BASE_DIR, "reg_results_seminar.csv")
+> OUT_REG_COEFS_CSV         <- file.path(BASE_DIR, "reg_coefs_seminar.csv")
+> 
+> OUT_REG_RESULTS_SURP_CSV  <- file.path(BASE_DIR, "reg_results_seminar_with_surprises.csv")
+> OUT_REG_COEFS_SURP_CSV    <- file.path(BASE_DIR, "reg_coefs_seminar_with_surprises.csv")
+> 
+> OUT_REG_COEFS_SHOCK_CSV   <- file.path(BASE_DIR, "reg_coefs_shock.csv")
+> 
+> # Heterogeneity outputs (households vs professionals)
+> OUT_REG_RESULTS_HET_CSV   <- file.path(BASE_DIR, "reg_results_heterogeneity_michigan_vs_spf.csv")
+> OUT_REG_COEFS_HET_CSV     <- file.path(BASE_DIR, "reg_coefs_heterogeneity_michigan_vs_spf.csv")
+> 
+> # ---------- Figures ----------
+> FIG_DIR <- file.path(BASE_DIR, "figures")
+> if (!dir.exists(FIG_DIR)) dir.create(FIG_DIR, recursive = TRUE)
+> 
+> FIG_TS_PANEL              <- file.path(FIG_DIR, "fig_ts_panel_michigan_spf_dli.png")
+> FIG_TS_PANEL_SURP         <- file.path(FIG_DIR, "fig_ts_panel_with_surprises.png")
+> 
+> FIG_SCATTER_LEVEL         <- file.path(FIG_DIR, "fig_scatter_level_michigan.png")
+> FIG_SCATTER_LEVEL_SURP    <- file.path(FIG_DIR, "fig_scatter_level_michigan_net_of_surprises.png")
+> FIG_SCATTER_DY            <- file.path(FIG_DIR, "fig_scatter_delta_michigan.png")
+> 
+> FIG_IRF_LOCALPROJ         <- file.path(FIG_DIR, "fig_localproj_irf_michigan.png")
+> FIG_IRF_LOCALPROJ_SURP    <- file.path(FIG_DIR, "fig_localproj_irf_michigan_with_surprises.png")
+> FIG_IRF_LOCALPROJ_SHOCK   <- file.path(FIG_DIR, "fig_localproj_irf_shock.png")
+> 
+> FIG_COEF_DLI              <- file.path(FIG_DIR, "fig_coef_dli_michigan.png")
+> FIG_COEF_DLI_SURP         <- file.path(FIG_DIR, "fig_coef_dli_michigan_with_surprises.png")
+> 
+> FIG_COEF_HET              <- file.path(FIG_DIR, "fig_coef_heterogeneity_michigan_vs_spf.png")
+> 
+> # ============================================================
+> # Switches
+> # ============================================================
+> RUN_SHOCK <- TRUE
+> 
+> # ============================================================
+> # Quick checks
+> # ============================================================
+> if (!dir.exists(BASE_DIR)) stop("BASE_DIR does not exist: ", BASE_DIR)
+> if (!dir.exists(STATEMENTS_DIR)) stop("STATEMENTS_DIR does not exist: ", STATEMENTS_DIR)
+> if (!file.exists(MICHIGAN_XLSX)) stop("Michigan file not found: ", MICHIGAN_XLSX)
+> if (!file.exists(SPF_XLSX)) stop("SPF file not found: ", SPF_XLSX)
+> if (!file.exists(FOMC_SURPRISES_CSV)) stop("Surprises file not found: ", FOMC_SURPRISES_CSV)
+> 
+> # ============================================================
+> # Helpers
+> # ============================================================
+> zscore <- function(x) {
++   s <- sd(x, na.rm = TRUE)
++   if (is.na(s) || s == 0) return(rep(0, length(x)))
++   (x - mean(x, na.rm = TRUE)) / s
++ }
+> 
+> to_quarter_start <- function(d) {
++   make_date(year(d), (quarter(d) - 1) * 3 + 1, 1)
++ }
+> 
+> extract_statement_text <- function(path) {
++   doc <- tryCatch(read_html(path), error = function(e) NULL)
++   if (is.null(doc)) return(NA_character_)
++ 
++   candidates <- c("main", "#article", "article", "div#content", "div#contentWrapper", "body")
++ 
++   txt <- NA_character_
++   for (css in candidates) {
++     nodes <- tryCatch(html_elements(doc, css), error = function(e) NULL)
++     if (!is.null(nodes) && length(nodes) > 0) {
++       t_try <- tryCatch(html_text(nodes), error = function(e) "")
++       t_try <- paste(t_try, collapse = "\n")
++       if (nchar(t_try) > 200) { txt <- t_try; break }
++     }
++   }
++ 
++   if (is.na(txt)) {
++     nodes <- tryCatch(html_elements(doc, "body"), error = function(e) NULL)
++     if (!is.null(nodes) && length(nodes) > 0) {
++       txt <- tryCatch(paste(html_text(nodes), collapse = "\n"), error = function(e) NA_character_)
++     }
++   }
++ 
++   if (is.na(txt)) return(NA_character_)
++ 
++   txt %>%
++     str_replace_all("\u00a0", " ") %>%
++     str_replace_all("\\s+", " ") %>%
++     trimws()
++ }
+> 
+> count_terms <- function(dfm_obj, terms_vec) {
++   present <- intersect(terms_vec, featnames(dfm_obj))
++   if (length(present) == 0) return(rep(0, ndoc(dfm_obj)))
++   as.numeric(rowSums(dfm_select(dfm_obj, pattern = present)))
++ }
+> 
+> count_phrases <- function(dfm_obj, phrases_vec) {
++   phrases_vec <- str_replace_all(phrases_vec, "\\s+", "_")
++   present <- intersect(phrases_vec, featnames(dfm_obj))
++   if (length(present) == 0) return(rep(0, ndoc(dfm_obj)))
++   as.numeric(rowSums(dfm_select(dfm_obj, pattern = present)))
++ }
+> 
+> hac_df_nw <- function(model, lag = 4, model_name = "model") {
++   vc <- sandwich::NeweyWest(model, lag = lag, prewhite = FALSE, adjust = TRUE)
++ 
++   b <- stats::coef(model)
++   se <- sqrt(diag(vc))
++   if (is.null(names(se))) names(se) <- rownames(vc)
++ 
++   common <- intersect(names(b), names(se))
++   b <- b[common]
++   se <- se[common]
++   se[!is.finite(se) | se == 0] <- NA_real_
++ 
++   tval  <- b / se
++   dfree <- stats::df.residual(model)
++   pval  <- 2 * stats::pt(abs(tval), df = dfree, lower.tail = FALSE)
++ 
++   data.frame(
++     model     = rep(model_name, length(b)),
++     term      = names(b),
++     estimate  = as.numeric(b),
++     std_error = as.numeric(se),
++     t_value   = as.numeric(tval),
++     p_value   = as.numeric(pval),
++     n         = rep(stats::nobs(model), length(b)),
++     r2        = rep(summary(model)$r.squared, length(b)),
++     adj_r2    = rep(summary(model)$adj.r.squared, length(b)),
++     stringsAsFactors = FALSE
++   )
++ }
+> 
+> extract_term_rows <- function(coef_tbl, terms) {
++   as_tibble(coef_tbl) %>%
++     filter(term %in% terms) %>%
++     mutate(
++       ci_lo = estimate - 1.96 * std_error,
++       ci_hi = estimate + 1.96 * std_error
++     )
++ }
+> 
+> # ---- Publication-safe labels (semantic fixes) ----
+> LBL_HH_LEVEL     <- "Household inflation expectations (survey level)"
+> LBL_PRO_LEVEL    <- "Professional inflation expectations (survey level)"
+> LBL_HH_Z         <- "Household inflation expectations (z)"
+> LBL_PRO_Z        <- "Professional inflation expectations (z)"
+> LBL_DLI_MEAN_Z   <- "Decisive Language Intensity (quarterly mean, z)"
+> LBL_DLI_LAST_Z   <- "Decisive Language Intensity (last statement in quarter, z)"
+> LBL_DLI_RESID    <- "DLI residual (controls)"
+> LBL_Y_RESID_HH   <- "Household expectations residual"
+> LBL_DY_RESID_HH  <- "Δ household expectations residual"
+> LBL_SURP_Z       <- "Monetary policy surprise (z)"
+> LBL_DLI_SHOCK_Z  <- "DLI shock proxy (AR(1) innovation, z)"
+> 
+> theme_set(
++   theme_minimal(base_size = 12) +
++     theme(
++       panel.grid.minor = element_blank(),
++       plot.title.position = "plot",
++       plot.title = element_text(face = "bold"),
++       axis.title = element_text(face = "bold")
++     )
++ )
+> 
+> # ============================================================
+> # (1) FOMC DLI (daily)
+> # ============================================================
+> message("FOMC: loading HTML files...")
+FOMC: loading HTML files...
+> 
+> files <- list.files(
++   STATEMENTS_DIR,
++   pattern = "\\.(htm|html)$",
++   full.names = TRUE,
++   ignore.case = TRUE
++ )
+> if (length(files) == 0) stop("No .htm/.html files found in: ", STATEMENTS_DIR)
+> 
+> raw_df <- tibble(
++   file_path = files,
++   file_name = basename(files)
++ ) %>%
++   mutate(
++     date_str = str_match(file_name, "^(\\d{4}-\\d{2}-\\d{2})")[, 2],
++     date     = as.Date(date_str)
++   ) %>%
++   filter(!is.na(date), date >= as.Date("2000-01-01")) %>%
++   arrange(date)
+> 
+> if (nrow(raw_df) == 0) stop("No valid FOMC files after date filtering (>=2000).")
+> 
+> message("FOMC: extracting text...")
+FOMC: extracting text...
+> raw_df <- raw_df %>% mutate(text = purrr::map_chr(file_path, extract_statement_text))
+> 
+> bad <- sum(is.na(raw_df$text) | nchar(raw_df$text) < 50)
+> if (bad > 0) warning(bad, " documents failed text extraction (NA/too short). Dropping them.")
+> raw_df <- raw_df %>% filter(!is.na(text), nchar(text) >= 50)
+> if (nrow(raw_df) == 0) stop("After extraction, no documents remain. Check HTML structure.")
+> 
+> # ---------- Dictionaries ----------
+> dict_decisive_uni <- c(
++   "will","must","ensure","maintain","continue","appropriate","committed",
++   "determined","necessary","ready","firmly","forcefully","promptly",
++   "consistent","sustain","preserve","achieve","support","strongly"
++ )
+> 
+> dict_hedge_uni <- c(
++   "may","might","could","appear","appears","appeared","likely","unlikely",
++   "suggest","suggests","suggested","uncertain","uncertainty","depending",
++   "some","somewhat","approximately","possibility","potential","risk","risks"
++ )
+> 
+> dict_inflation_uni <- c(
++   "inflation","prices","price","pce","cpi","disinflation","deflation",
++   "stability","expectations","pressures"
++ )
+> 
+> dict_decisive_bi <- c(
++   "stands ready","will act","will take","is committed","remain committed",
++   "will continue","will maintain","price stability"
++ )
+> 
+> dict_hedge_bi <- c(
++   "at this","at present","in coming","could be","may be","might be",
++   "appear to","likely to","depending on"
++ )
+> 
+> dict_inflation_bi <- c(
++   "price stability","inflation expectations","inflation pressures"
++ )
+> 
+> message("FOMC: tokenizing + counting...")
+FOMC: tokenizing + counting...
+> corp <- quanteda::corpus(raw_df, text_field = "text", docid_field = "file_name")
+> 
+> toks <- quanteda::tokens(
++   corp,
++   remove_punct      = TRUE,
++   remove_numbers    = TRUE,
++   remove_symbols    = TRUE,
++   remove_separators = TRUE
++ ) %>%
++   quanteda::tokens_tolower()
+> 
+> N_words <- quanteda::ntoken(toks)
+> if (any(N_words == 0)) warning("Some documents have zero tokens after cleaning (rare).")
+> 
+> dfm_uni <- quanteda::dfm(toks)
+> dec_uni <- count_terms(dfm_uni, dict_decisive_uni)
+> hed_uni <- count_terms(dfm_uni, dict_hedge_uni)
+> inf_uni <- count_terms(dfm_uni, dict_inflation_uni)
+> 
+> toks_bi <- quanteda::tokens_ngrams(toks, n = 2)
+> dfm_bi  <- quanteda::dfm(toks_bi)
+> dec_bi <- count_phrases(dfm_bi, dict_decisive_bi)
+> hed_bi <- count_phrases(dfm_bi, dict_hedge_bi)
+> inf_bi <- count_phrases(dfm_bi, dict_inflation_bi)
+> 
+> d_t <- 1000 * (dec_uni + dec_bi) / N_words
+> h_t <- 1000 * (hed_uni + hed_bi) / N_words
+> i_t <- 1000 * (inf_uni + inf_bi) / N_words
+> 
+> gamma <- 0.5
+> d_net <- d_t - h_t
+> 
+> DLI_2 <- zscore(d_net)
+> DLI_1 <- zscore(d_net) * (1 + gamma * zscore(i_t))
+> DLI_3 <- zscore(d_net) * as.numeric(i_t > median(i_t, na.rm = TRUE))
+> 
+> dli_daily <- raw_df %>%
++   transmute(
++     date,
++     date_q = to_quarter_start(date),
++     file_name,
++     words = as.integer(N_words),
++     d_per_1000 = as.numeric(d_t),
++     h_per_1000 = as.numeric(h_t),
++     i_per_1000 = as.numeric(i_t),
++     d_net_per_1000 = as.numeric(d_net),
++     DLI_1 = as.numeric(DLI_1),
++     DLI_2 = as.numeric(DLI_2),
++     DLI_3 = as.numeric(DLI_3)
++   ) %>%
++   arrange(date)
+> 
+> write_csv(dli_daily, OUT_DLI_DAILY_CSV)
+
+[1mwrote[0m [32m1.30kB[0m in [36m 0s[0m, [32m94.84kB/s[0m
+                                                                              
+[1mwrote[0m [32m2.15GB[0m in [36m 0s[0m, [32m2.15GB/s[0m
+                                                                              
+> if (!file.exists(OUT_DLI_DAILY_CSV)) stop("CSV not created: ", OUT_DLI_DAILY_CSV)
+> message("Saved daily DLI: ", OUT_DLI_DAILY_CSV)
+Saved daily DLI: C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/fomc_dli_daily.csv
+> 
+> # ============================================================
+> # (2) Aggregate DLI to quarterly (mean + last-in-quarter)
+> # ============================================================
+> dli_quarterly <- dli_daily %>%
++   group_by(date_q) %>%
++   summarise(
++     n_statements = n(),
++     words_sum    = sum(words, na.rm = TRUE),
++ 
++     dli1_q_mean  = mean(DLI_1, na.rm = TRUE),
++     dli2_q_mean  = mean(DLI_2, na.rm = TRUE),
++     dli3_q_mean  = mean(DLI_3, na.rm = TRUE),
++ 
++     dli2_q_last  = last(DLI_2),
++     dli1_q_last  = last(DLI_1),
++ 
++     d_net_q_mean = mean(d_net_per_1000, na.rm = TRUE),
++     d_q_mean     = mean(d_per_1000, na.rm = TRUE),
++     h_q_mean     = mean(h_per_1000, na.rm = TRUE),
++     i_q_mean     = mean(i_per_1000, na.rm = TRUE),
++     .groups = "drop"
++   ) %>%
++   arrange(date_q)
+> 
+> write_csv(dli_quarterly, OUT_DLI_QUARTERLY_CSV)
+
+[1mwrote[0m [32m1.44kB[0m in [36m 0s[0m, [32m111.77MB/s[0m
+                                                                              
+[1mwrote[0m [32m2.15GB[0m in [36m 0s[0m, [32m2.15GB/s[0m
+                                                                              
+> if (!file.exists(OUT_DLI_QUARTERLY_CSV)) stop("CSV not created: ", OUT_DLI_QUARTERLY_CSV)
+> message("Saved quarterly DLI: ", OUT_DLI_QUARTERLY_CSV)
+Saved quarterly DLI: C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/fomc_dli_quarterly.csv
+> 
+> # ============================================================
+> # (3) Households monthly -> quarterly
+> # ============================================================
+> message("Households: reading + aggregating...")
+Households: reading + aggregating...
+> michigan <- readxl::read_excel(MICHIGAN_XLSX) %>% janitor::clean_names()
+
+-
+/
+                                                                              
+
+/
+                                                                              
+
+-
+                                                                              
+> 
+> required_cols <- c("month", "year", "mean")
+> if (!all(required_cols %in% names(michigan))) {
++   stop("Household file must contain columns: month, year, mean. Found: ",
++        paste(names(michigan), collapse = ", "))
++ }
+> 
+> michigan_q <- michigan %>%
++   mutate(
++     month  = as.integer(month),
++     year   = as.integer(year),
++     mean   = as.numeric(mean),
++     date_m = make_date(year, month, 1),
++     date_q = to_quarter_start(date_m)
++   ) %>%
++   group_by(date_q) %>%
++   summarise(
++     michigan_exp_infl = mean(mean, na.rm = TRUE),
++     michigan_n_months = sum(!is.na(mean)),
++     .groups = "drop"
++   ) %>%
++   arrange(date_q)
+> 
+> # ============================================================
+> # (4) SPF quarterly (professionals)
+> # ============================================================
+> message("Professionals (SPF): reading quarterly series...")
+Professionals (SPF): reading quarterly series...
+> spf <- readxl::read_excel(SPF_XLSX) %>% janitor::clean_names()
+
+-
+/
+                                                                              
+
+/
+                                                                              
+
+-
+                                                                              
+> 
+> required_cols_spf <- c("year", "quarter", "cpi1")
+> if (!all(required_cols_spf %in% names(spf))) {
++   stop("SPF file must contain columns: year, quarter, cpi1. Found: ",
++        paste(names(spf), collapse = ", "))
++ }
+> 
+> spf_q <- spf %>%
++   mutate(
++     year    = as.integer(year),
++     quarter = as.integer(quarter),
++     cpi1    = as.numeric(cpi1),
++     date_q  = make_date(year, (quarter - 1) * 3 + 1, 1)
++   ) %>%
++   transmute(
++     date_q,
++     spf_exp_infl = cpi1
++   ) %>%
++   arrange(date_q)
+> 
+> # ============================================================
+> # (5) FOMC surprises daily/events -> quarterly aggregation
+> # ============================================================
+> message("Surprises: reading + aggregating to quarterly...")
+Surprises: reading + aggregating to quarterly...
+> surp_raw <- readr::read_csv(FOMC_SURPRISES_CSV, show_col_types = FALSE) %>% janitor::clean_names()
+
+[1mindexing[0m [34mfomc_surprises.csv[0m [=============================] [32m110.18MB/s[0m, eta: [36m 0s[0m
+                                                                                                                   
+> 
+> need <- c("date","statement","press_conference","monetary_event")
+> if (!all(need %in% names(surp_raw))) {
++   stop("Surprises CSV must contain: Date, Statement, Press Conference, Monetary Event. Found: ",
++        paste(names(surp_raw), collapse = ", "))
++ }
+> 
+> surp_q <- surp_raw %>%
++   mutate(
++     date = as.Date(date),
++     date_q = to_quarter_start(date),
++     statement = as.numeric(statement),
++     press_conference = as.numeric(press_conference),
++     monetary_event = as.numeric(monetary_event)
++   ) %>%
++   group_by(date_q) %>%
++   summarise(
++     surpr_statement = sum(statement, na.rm = TRUE),
++     surpr_press     = sum(press_conference, na.rm = TRUE),
++     surpr_monetary  = sum(monetary_event, na.rm = TRUE),
++     surpr_events    = n(),
++     .groups = "drop"
++   ) %>%
++   arrange(date_q) %>%
++   mutate(
++     surpr_monetary_abs   = abs(surpr_monetary),
++     surpr_monetary_z     = zscore(surpr_monetary),
++     surpr_monetary_abs_z = zscore(surpr_monetary_abs)
++   )
+> 
+> write_csv(surp_q, OUT_SURPRISES_Q_CSV)
+
+[1mwrote[0m [32m649.00B[0m in [36m 0s[0m, [32m49.49MB/s[0m
+                                                                              
+[1mwrote[0m [32m2.15GB[0m in [36m 0s[0m, [32m2.15GB/s[0m
+                                                                              
+> if (!file.exists(OUT_SURPRISES_Q_CSV)) stop("CSV not created: ", OUT_SURPRISES_Q_CSV)
+> message("Saved quarterly surprises: ", OUT_SURPRISES_Q_CSV)
+Saved quarterly surprises: C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/fomc_surprises_quarterly.csv
+> 
+> # ============================================================
+> # (6) Merge quarterly panel + derived vars
+> # ============================================================
+> message("Merging quarterly panel...")
+Merging quarterly panel...
+> 
+> panel_q <- dli_quarterly %>%
++   left_join(michigan_q, by = "date_q") %>%
++   left_join(spf_q,      by = "date_q") %>%
++   left_join(surp_q,     by = "date_q") %>%
++   arrange(date_q) %>%
++   mutate(
++     # Household lags / deltas
++     michigan_l1 = lag(michigan_exp_infl, 1),
++     michigan_l2 = lag(michigan_exp_infl, 2),
++     d_michigan  = michigan_exp_infl - lag(michigan_exp_infl, 1),
++ 
++     # Professional lags / deltas
++     spf_l1 = lag(spf_exp_infl, 1),
++     d_spf  = spf_exp_infl - lag(spf_exp_infl, 1),
++ 
++     # DLI lags
++     dli2_l1 = lag(dli2_q_mean, 1),
++     dli2_l2 = lag(dli2_q_mean, 2),
++     dli2_l3 = lag(dli2_q_mean, 3),
++ 
++     n_stmt_z = zscore(n_statements),
++ 
++     surpr_monetary_l1 = lag(surpr_monetary, 1)
++   )
+> 
+> write_csv(panel_q, OUT_PANEL_QUARTERLY)
+
+[1mwrote[0m [32m2.78kB[0m in [36m 0s[0m, [32m155.64MB/s[0m
+                                                                              
+[1mwrote[0m [32m2.15GB[0m in [36m 0s[0m, [32m2.15GB/s[0m
+                                                                              
+> if (!file.exists(OUT_PANEL_QUARTERLY)) stop("CSV not created: ", OUT_PANEL_QUARTERLY)
+> message("Saved quarterly panel: ", OUT_PANEL_QUARTERLY)
+Saved quarterly panel: C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/panel_quarterly_dli_michigan_spf.csv
+> 
+> message("\nSanity checks (panel):")
+
+Sanity checks (panel):
+> print(panel_q %>% summarise(
++   n_q = n(),
++   q_min = min(date_q, na.rm = TRUE),
++   q_max = max(date_q, na.rm = TRUE),
++   share_households = mean(!is.na(michigan_exp_infl)),
++   share_professionals = mean(!is.na(spf_exp_infl)),
++   share_surpr    = mean(!is.na(surpr_monetary))
++ ))
+# A tibble: 1 × 6
+    n_q q_min      q_max      share_households share_professionals share_surpr
+  <int> <date>     <date>                <dbl>               <dbl>       <dbl>
+1   104 2000-01-01 2025-10-01                1                   1       0.231
+> 
+> # ============================================================
+> # (7) Baseline regressions (households) - Newey-West
+> # ============================================================
+> message("\nRunning baseline regressions (households, Newey-West)...")
+
+Running baseline regressions (households, Newey-West)...
+> 
+> panel_base <- panel_q %>% filter(!is.na(michigan_l1))
+> 
+> m1 <- lm(michigan_exp_infl ~ dli2_q_mean, data = panel_base)
+> m2 <- lm(michigan_exp_infl ~ dli2_q_mean + n_statements, data = panel_base)
+> m3 <- lm(michigan_exp_infl ~ dli2_q_mean + n_statements + michigan_l1, data = panel_base)
+> 
+> m4 <- lm(d_michigan ~ dli2_q_mean + n_statements, data = panel_base)
+> m5 <- lm(michigan_exp_infl ~ dli1_q_mean + n_statements + michigan_l1, data = panel_base)
+> 
+> m6 <- lm(michigan_exp_infl ~ dli2_q_mean + dli2_l1 + n_statements + michigan_l1, data = panel_base)
+> m7 <- lm(michigan_exp_infl ~ dli2_q_last + n_statements + michigan_l1, data = panel_base)
+> 
+> coef_tbl <- do.call(rbind, list(
++   hac_df_nw(m1, lag = 4, model_name = "b1: households level ~ DLI (mean)"),
++   hac_df_nw(m2, lag = 4, model_name = "b2: + number of statements"),
++   hac_df_nw(m3, lag = 4, model_name = "b3: + lagged expectations"),
++   hac_df_nw(m4, lag = 4, model_name = "b4: Δ expectations ~ DLI (mean) + statements"),
++   hac_df_nw(m5, lag = 4, model_name = "b5: DLI (interaction variant) + controls"),
++   hac_df_nw(m6, lag = 4, model_name = "b6: distributed lag (DLI t, t-1) + controls"),
++   hac_df_nw(m7, lag = 4, model_name = "b7: DLI (last in quarter) + controls")
++ ))
+> 
+> reg_summary <- as_tibble(coef_tbl) %>%
++   group_by(model) %>%
++   summarise(
++     n = first(n),
++     r2 = first(r2),
++     adj_r2 = first(adj_r2),
++     .groups = "drop"
++   )
+> 
+> write_csv(reg_summary, OUT_REG_RESULTS_CSV)
+
+[1mwrote[0m [32m2.15GB[0m in [36m 0s[0m, [32m2.15GB/s[0m
+                                                                              
+> write_csv(as_tibble(coef_tbl), OUT_REG_COEFS_CSV)
+
+[1mwrote[0m [32m1.30kB[0m in [36m 0s[0m, [32m64.96MB/s[0m
+                                                                              
+[1mwrote[0m [32m2.15GB[0m in [36m 0s[0m, [32m2.15GB/s[0m
+                                                                              
+> if (!file.exists(OUT_REG_RESULTS_CSV)) stop("CSV not created: ", OUT_REG_RESULTS_CSV)
+> if (!file.exists(OUT_REG_COEFS_CSV)) stop("CSV not created: ", OUT_REG_COEFS_CSV)
+> 
+> message("Saved regression summaries: ", OUT_REG_RESULTS_CSV)
+Saved regression summaries: C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/reg_results_seminar.csv
+> message("Saved regression coefficients (HAC): ", OUT_REG_COEFS_CSV)
+Saved regression coefficients (HAC): C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/reg_coefs_seminar.csv
+> 
+> # ============================================================
+> # (8) Surprise-augmented regressions (post-2020) - households
+> # ============================================================
+> message("\nRunning surprise-augmented regressions (households, post-2020)...")
+
+Running surprise-augmented regressions (households, post-2020)...
+> 
+> panel_surp <- panel_q %>% filter(!is.na(michigan_l1), !is.na(surpr_monetary))
+> 
+> m8  <- lm(michigan_exp_infl ~ dli2_q_mean + n_statements + michigan_l1 + surpr_monetary, data = panel_surp)
+> m9  <- lm(michigan_exp_infl ~ dli2_q_mean + n_statements + michigan_l1 + surpr_monetary_abs, data = panel_surp)
+> m10 <- lm(michigan_exp_infl ~ dli2_q_mean + n_statements + michigan_l1 + surpr_statement + surpr_press, data = panel_surp)
+> m11 <- lm(d_michigan ~ dli2_q_mean + n_statements + surpr_monetary, data = panel_surp)
+> 
+> coef_tbl_surp <- do.call(rbind, list(
++   hac_df_nw(m8,  lag = 4, model_name = "s1: households + monetary surprise (post-2020)"),
++   hac_df_nw(m9,  lag = 4, model_name = "s2: households + |monetary surprise| (post-2020)"),
++   hac_df_nw(m10, lag = 4, model_name = "s3: households + statement & press surprises (post-2020)"),
++   hac_df_nw(m11, lag = 4, model_name = "s4: Δ expectations + monetary surprise (post-2020)")
++ ))
+> 
+> reg_summary_surp <- as_tibble(coef_tbl_surp) %>%
++   group_by(model) %>%
++   summarise(
++     n = first(n),
++     r2 = first(r2),
++     adj_r2 = first(adj_r2),
++     .groups = "drop"
++   )
+> 
+> write_csv(reg_summary_surp, OUT_REG_RESULTS_SURP_CSV)
+
+[1mwrote[0m [32m2.15GB[0m in [36m 0s[0m, [32m2.15GB/s[0m
+                                                                              
+> write_csv(as_tibble(coef_tbl_surp), OUT_REG_COEFS_SURP_CSV)
+
+[1mwrote[0m [32m1.43kB[0m in [36m 0s[0m, [32m111.23MB/s[0m
+                                                                              
+[1mwrote[0m [32m2.15GB[0m in [36m 0s[0m, [32m2.15GB/s[0m
+                                                                              
+> if (!file.exists(OUT_REG_RESULTS_SURP_CSV)) stop("CSV not created: ", OUT_REG_RESULTS_SURP_CSV)
+> if (!file.exists(OUT_REG_COEFS_SURP_CSV)) stop("CSV not created: ", OUT_REG_COEFS_SURP_CSV)
+> 
+> message("Saved surprise regression summaries: ", OUT_REG_RESULTS_SURP_CSV)
+Saved surprise regression summaries: C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/reg_results_seminar_with_surprises.csv
+> message("Saved surprise regression coefficients (HAC): ", OUT_REG_COEFS_SURP_CSV)
+Saved surprise regression coefficients (HAC): C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/reg_coefs_seminar_with_surprises.csv
+> 
+> # ============================================================
+> # (9) Figures
+> # ============================================================
+> 
+> # ---- TS panel: households + professionals + DLI ----
+> ts_df <- panel_q %>%
++   transmute(
++     date_q,
++     michigan_exp_infl,
++     spf_exp_infl,
++     dli2_q_mean,
++     dli2_q_last
++   ) %>%
++   mutate(
++     hh_z       = zscore(michigan_exp_infl),
++     pro_z      = zscore(spf_exp_infl),
++     dli_mean_z = zscore(dli2_q_mean),
++     dli_last_z = zscore(dli2_q_last)
++   ) %>%
++   pivot_longer(
++     cols = c(hh_z, pro_z, dli_mean_z, dli_last_z),
++     names_to = "series",
++     values_to = "value"
++   ) %>%
++   mutate(
++     series = recode(series,
++       hh_z       = LBL_HH_Z,
++       pro_z      = LBL_PRO_Z,
++       dli_mean_z = LBL_DLI_MEAN_Z,
++       dli_last_z = LBL_DLI_LAST_Z
++     )
++   )
+> 
+> p_ts <- ggplot(ts_df, aes(x = date_q, y = value, color = series)) +
++   geom_line(linewidth = 0.7, alpha = 0.95) +
++   labs(
++     title = "Inflation expectations and FOMC decisive language (standardized)",
++     x = NULL, y = "z-score", color = NULL
++   ) +
++   scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
++   theme(legend.position = "bottom")
+> 
+> ggsave(FIG_TS_PANEL, p_ts, width = 10.5, height = 5.5, dpi = 300)
+> 
+> # ---- TS with surprises ----
+> ts_surp <- panel_q %>%
++   transmute(
++     date_q,
++     dli2_q_mean,
++     michigan_exp_infl,
++     spf_exp_infl,
++     surpr_monetary
++   ) %>%
++   mutate(
++     dli_mean_z = zscore(dli2_q_mean),
++     hh_z       = zscore(michigan_exp_infl),
++     pro_z      = zscore(spf_exp_infl),
++     surp_z     = zscore(surpr_monetary)
++   ) %>%
++   pivot_longer(
++     cols = c(dli_mean_z, hh_z, pro_z, surp_z),
++     names_to = "series",
++     values_to = "value"
++   ) %>%
++   mutate(
++     series = recode(series,
++       dli_mean_z = LBL_DLI_MEAN_Z,
++       hh_z       = LBL_HH_Z,
++       pro_z      = LBL_PRO_Z,
++       surp_z     = LBL_SURP_Z
++     )
++   )
+> 
+> p_ts_s <- ggplot(ts_surp, aes(x = date_q, y = value, color = series)) +
++   geom_line(linewidth = 0.7, alpha = 0.95) +
++   labs(
++     title = "Decisive language, expectations, and monetary policy surprises (standardized)",
++     x = NULL, y = "z-score", color = NULL
++   ) +
++   scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
++   theme(legend.position = "bottom")
+> 
+> ggsave(FIG_TS_PANEL_SURP, p_ts_s, width = 10.5, height = 5.5, dpi = 300)
+Mensagen de aviso:
+Removed 80 rows containing missing values or values outside the scale range
+(`geom_line()`). 
+> 
+> # ---- Partial scatter (levels) households ----
+> tmp <- panel_base %>%
++   mutate(
++     y_res   = resid(lm(michigan_exp_infl ~ n_statements + michigan_l1, data = .)),
++     dli_res = resid(lm(dli2_q_mean      ~ n_statements + michigan_l1, data = .))
++   )
+> 
+> p_scatter_lvl <- ggplot(tmp, aes(x = dli_res, y = y_res)) +
++   geom_point(alpha = 0.6, size = 1.7) +
++   geom_smooth(method = "lm", se = TRUE, linewidth = 0.8) +
++   labs(
++     title = "Partial relationship: decisive language and household expectations",
++     x = paste0(LBL_DLI_RESID, " (controls: statements, lagged expectations)"),
++     y = LBL_Y_RESID_HH
++   )
+> 
+> ggsave(FIG_SCATTER_LEVEL, p_scatter_lvl, width = 7.5, height = 5.5, dpi = 300)
+`geom_smooth()` using formula = 'y ~ x'
+> 
+> # ---- Partial scatter net of surprises (post-2020) ----
+> tmp_s <- panel_surp %>%
++   mutate(
++     y_res   = resid(lm(michigan_exp_infl ~ n_statements + michigan_l1 + surpr_monetary, data = .)),
++     dli_res = resid(lm(dli2_q_mean      ~ n_statements + michigan_l1 + surpr_monetary, data = .))
++   )
+> 
+> p_scatter_lvl_s <- ggplot(tmp_s, aes(x = dli_res, y = y_res)) +
++   geom_point(alpha = 0.6, size = 1.7) +
++   geom_smooth(method = "lm", se = TRUE, linewidth = 0.8) +
++   labs(
++     title = "Partial relationship: decisive language and household expectations (net of surprises)",
++     x = paste0(LBL_DLI_RESID, " (controls: statements, lagged expectations, surprise)"),
++     y = LBL_Y_RESID_HH
++   )
+> 
+> ggsave(FIG_SCATTER_LEVEL_SURP, p_scatter_lvl_s, width = 7.5, height = 5.5, dpi = 300)
+`geom_smooth()` using formula = 'y ~ x'
+> 
+> # ---- Partial scatter (delta) ----
+> tmp_d <- panel_base %>%
++   filter(!is.na(d_michigan)) %>%
++   mutate(
++     dy_res  = resid(lm(d_michigan ~ n_statements, data = .)),
++     dli_res = resid(lm(dli2_q_mean ~ n_statements, data = .))
++   )
+> 
+> p_scatter_dy <- ggplot(tmp_d, aes(x = dli_res, y = dy_res)) +
++   geom_point(alpha = 0.6, size = 1.7) +
++   geom_smooth(method = "lm", se = TRUE, linewidth = 0.8) +
++   labs(
++     title = "Changes: decisive language and changes in household expectations",
++     x = paste0(LBL_DLI_RESID, " (control: statements)"),
++     y = LBL_DY_RESID_HH
++   )
+> 
+> ggsave(FIG_SCATTER_DY, p_scatter_dy, width = 7.5, height = 5.5, dpi = 300)
+`geom_smooth()` using formula = 'y ~ x'
+> 
+> # ---- Local projection IRF (household levels) ----
+> H <- 4
+> lp_list <- list()
+> 
+> for (h in 0:H) {
++   df_h <- panel_q %>%
++     mutate(y_lead = lead(michigan_exp_infl, h)) %>%
++     filter(!is.na(michigan_l1), !is.na(y_lead),
++            !is.na(dli2_q_mean), !is.na(n_statements))
++ 
++   mod_h <- lm(y_lead ~ dli2_q_mean + n_statements + michigan_l1, data = df_h)
++   vc_h  <- sandwich::NeweyWest(mod_h, lag = 4, prewhite = FALSE, adjust = TRUE)
++ 
++   b  <- coef(mod_h)["dli2_q_mean"]
++   se <- sqrt(diag(vc_h))["dli2_q_mean"]
++ 
++   lp_list[[h + 1]] <- tibble(
++     h = h,
++     beta = as.numeric(b),
++     se = as.numeric(se),
++     ci_lo = beta - 1.96 * se,
++     ci_hi = beta + 1.96 * se,
++     n = nobs(mod_h)
++   )
++ }
+> 
+> lp_df <- bind_rows(lp_list)
+> 
+> p_irf <- ggplot(lp_df, aes(x = h, y = beta)) +
++   geom_hline(yintercept = 0, linewidth = 0.6, alpha = 0.6) +
++   geom_point(size = 2) +
++   geom_line(linewidth = 0.7) +
++   geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi), width = 0.15, linewidth = 0.7) +
++   scale_x_continuous(breaks = 0:H) +
++   labs(
++     title = "Local projections: response of household expectations to decisive language",
++     x = "Horizon h (quarters ahead)",
++     y = "β(h) on DLI (Newey-West 95% CI)"
++   )
+> 
+> ggsave(FIG_IRF_LOCALPROJ, p_irf, width = 7.5, height = 5.5, dpi = 300)
+> 
+> # ---- Local projection with surprises (post-2020) ----
+> lp_list2 <- list()
+> for (h in 0:H) {
++   df_h <- panel_surp %>%
++     mutate(y_lead = lead(michigan_exp_infl, h)) %>%
++     filter(!is.na(y_lead),
++            !is.na(dli2_q_mean), !is.na(n_statements), !is.na(michigan_l1), !is.na(surpr_monetary))
++ 
++   mod_h <- lm(y_lead ~ dli2_q_mean + n_statements + michigan_l1 + surpr_monetary, data = df_h)
++   vc_h  <- sandwich::NeweyWest(mod_h, lag = 4, prewhite = FALSE, adjust = TRUE)
++ 
++   b  <- coef(mod_h)["dli2_q_mean"]
++   se <- sqrt(diag(vc_h))["dli2_q_mean"]
++ 
++   lp_list2[[h + 1]] <- tibble(
++     h = h,
++     beta = as.numeric(b),
++     se = as.numeric(se),
++     ci_lo = beta - 1.96 * se,
++     ci_hi = beta + 1.96 * se,
++     n = nobs(mod_h)
++   )
++ }
+> 
+> lp_df2 <- bind_rows(lp_list2)
+> 
+> p_irf2 <- ggplot(lp_df2, aes(x = h, y = beta)) +
++   geom_hline(yintercept = 0, linewidth = 0.6, alpha = 0.6) +
++   geom_point(size = 2) +
++   geom_line(linewidth = 0.7) +
++   geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi), width = 0.15, linewidth = 0.7) +
++   scale_x_continuous(breaks = 0:H) +
++   labs(
++     title = "Local projections: response of household expectations to decisive language (controlling for surprises)",
++     x = "Horizon h (quarters ahead)",
++     y = "β(h) on DLI (Newey-West 95% CI)"
++   )
+> 
+> ggsave(FIG_IRF_LOCALPROJ_SURP, p_irf2, width = 7.5, height = 5.5, dpi = 300)
+> 
+> # ---- Coef plot: DLI across baseline models ----
+> coef_plot_df <- extract_term_rows(
++   coef_tbl,
++   terms = c("dli2_q_mean","dli2_l1","dli2_q_last","dli1_q_mean")
++ ) %>%
++   filter(!is.na(std_error)) %>%
++   mutate(
++     term = recode(term,
++       dli2_q_mean  = "DLI (quarterly mean, t)",
++       dli2_l1      = "DLI (t-1)",
++       dli2_q_last  = "DLI (last statement in quarter)",
++       dli1_q_mean  = "DLI (interaction variant, mean)"
++     )
++   )
+> 
+> p_coef <- ggplot(coef_plot_df, aes(x = term, y = estimate)) +
++   geom_hline(yintercept = 0, linewidth = 0.6, alpha = 0.6) +
++   geom_point(size = 2) +
++   geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi), width = 0.15, linewidth = 0.7) +
++   facet_wrap(~ model, ncol = 1, scales = "free_y") +
++   coord_flip() +
++   labs(
++     title = "Estimated effects of decisive language on household expectations (Newey-West 95% CI)",
++     x = NULL, y = "Coefficient"
++   ) +
++   theme(legend.position = "none")
+> 
+> ggsave(FIG_COEF_DLI, p_coef, width = 10.5, height = 10.5, dpi = 300)
+> 
+> # ---- Coef plot: DLI + surprises (post-2020) ----
+> coef_plot_df2 <- extract_term_rows(
++   coef_tbl_surp,
++   terms = c("dli2_q_mean","surpr_monetary","surpr_monetary_abs","surpr_statement","surpr_press")
++ ) %>%
++   filter(!is.na(std_error)) %>%
++   mutate(
++     term = recode(term,
++       dli2_q_mean = "DLI (quarterly mean, t)",
++       surpr_monetary = "Monetary policy surprise (sum in quarter)",
++       surpr_monetary_abs = "Absolute monetary policy surprise",
++       surpr_statement = "Statement surprise",
++       surpr_press = "Press conference surprise"
++     )
++   )
+> 
+> p_coef2 <- ggplot(coef_plot_df2, aes(x = term, y = estimate)) +
++   geom_hline(yintercept = 0, linewidth = 0.6, alpha = 0.6) +
++   geom_point(size = 2) +
++   geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi), width = 0.15, linewidth = 0.7) +
++   facet_wrap(~ model, ncol = 1, scales = "free_y") +
++   coord_flip() +
++   labs(
++     title = "Decisive language and monetary policy surprises: coefficients (Newey-West 95% CI)",
++     x = NULL, y = "Coefficient"
++   ) +
++   theme(legend.position = "none")
+> 
+> ggsave(FIG_COEF_DLI_SURP, p_coef2, width = 10.5, height = 9.5, dpi = 300)
+> 
+> # ============================================================
+> # (10) OPTIONAL: DLI shock proxy block (separated)
+> # ============================================================
+> if (RUN_SHOCK) {
++   message("\nRunning DLI shock block...")
++ 
++   panel_shock <- panel_q %>%
++     filter(!is.na(dli2_l1), !is.na(michigan_l1))
++ 
++   dli_pred_mod <- lm(dli2_q_mean ~ dli2_l1, data = panel_shock)
++ 
++   panel_shock <- panel_shock %>%
++     mutate(
++       dli2_shock    = resid(dli_pred_mod),
++       dli2_shock_z  = zscore(dli2_shock)
++     )
++ 
++   m_sh <- lm(michigan_exp_infl ~ dli2_shock_z + n_statements + michigan_l1, data = panel_shock)
++ 
++   coef_tbl_shock <- hac_df_nw(m_sh, lag = 4, model_name = "shock: households ~ DLI shock + controls")
++   write_csv(as_tibble(coef_tbl_shock), OUT_REG_COEFS_SHOCK_CSV)
++   if (!file.exists(OUT_REG_COEFS_SHOCK_CSV)) stop("CSV not created: ", OUT_REG_COEFS_SHOCK_CSV)
++ 
++   lp_list_sh <- list()
++   for (h in 0:H) {
++     df_h <- panel_shock %>%
++       mutate(y_lead = lead(michigan_exp_infl, h)) %>%
++       filter(!is.na(y_lead), !is.na(dli2_shock_z),
++              !is.na(n_statements), !is.na(michigan_l1))
++ 
++     mod_h <- lm(y_lead ~ dli2_shock_z + n_statements + michigan_l1, data = df_h)
++     vc_h  <- sandwich::NeweyWest(mod_h, lag = 4, prewhite = FALSE, adjust = TRUE)
++ 
++     b  <- coef(mod_h)["dli2_shock_z"]
++     se <- sqrt(diag(vc_h))["dli2_shock_z"]
++ 
++     lp_list_sh[[h + 1]] <- tibble(
++       h = h, beta = as.numeric(b), se = as.numeric(se),
++       ci_lo = beta - 1.96 * se, ci_hi = beta + 1.96 * se,
++       n = nobs(mod_h)
++     )
++   }
++ 
++   lp_df_shock <- bind_rows(lp_list_sh)
++ 
++   p_irf_shock <- ggplot(lp_df_shock, aes(x = h, y = beta)) +
++     geom_hline(yintercept = 0, linewidth = 0.6, alpha = 0.6) +
++     geom_point(size = 2) +
++     geom_line(linewidth = 0.7) +
++     geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi), width = 0.15, linewidth = 0.7) +
++     scale_x_continuous(breaks = 0:H) +
++     labs(
++       title = "Local projections: response of household expectations to DLI shock proxy",
++       x = "Horizon h (quarters ahead)",
++       y = "β(h) on DLI shock (Newey-West 95% CI)"
++     )
++ 
++   ggsave(FIG_IRF_LOCALPROJ_SHOCK, p_irf_shock, width = 7.5, height = 5.5, dpi = 300)
++ }
+
+Running DLI shock block...
+
+[1mwrote[0m [32m2.15GB[0m in [36m 0s[0m, [32m2.15GB/s[0m
+                                                                              
+> 
+> # ============================================================
+> # (11) Heterogeneity: households vs professionals
+> # Same RHS, group-specific lag(y)
+> # ============================================================
+> message("\nRunning heterogeneity test: households vs professionals...")
+
+Running heterogeneity test: households vs professionals...
+> 
+> panel_het <- panel_q %>%
++   filter(!is.na(michigan_exp_infl), !is.na(spf_exp_infl),
++          !is.na(michigan_l1), !is.na(spf_l1),
++          !is.na(dli2_q_mean), !is.na(n_statements))
+> 
+> g_hh  <- lm(michigan_exp_infl ~ dli2_q_mean + n_statements + michigan_l1, data = panel_het)
+> g_pro <- lm(spf_exp_infl      ~ dli2_q_mean + n_statements + spf_l1,      data = panel_het)
+> 
+> coef_het <- bind_rows(
++   hac_df_nw(g_hh,  lag = 4, model_name = "h1: households ~ DLI + controls"),
++   hac_df_nw(g_pro, lag = 4, model_name = "h2: professionals ~ DLI + controls")
++ )
+> 
+> # Optional: heterogeneity + surprises (post-2020 common sample)
+> panel_het_s <- panel_q %>%
++   filter(!is.na(michigan_exp_infl), !is.na(spf_exp_infl),
++          !is.na(michigan_l1), !is.na(spf_l1),
++          !is.na(dli2_q_mean), !is.na(n_statements),
++          !is.na(surpr_monetary))
+> 
+> if (nrow(panel_het_s) >= 12) {
++   g_hh_s  <- lm(michigan_exp_infl ~ dli2_q_mean + n_statements + michigan_l1 + surpr_monetary, data = panel_het_s)
++   g_pro_s <- lm(spf_exp_infl      ~ dli2_q_mean + n_statements + spf_l1      + surpr_monetary, data = panel_het_s)
++ 
++   coef_het <- bind_rows(
++     coef_het,
++     hac_df_nw(g_hh_s,  lag = 4, model_name = "h3: households + surprise (post-2020)"),
++     hac_df_nw(g_pro_s, lag = 4, model_name = "h4: professionals + surprise (post-2020)")
++   )
++ } else {
++   warning("Heterogeneity + surprise block skipped: insufficient post-2020 common sample.")
++ }
+> 
+> reg_het_sum <- as_tibble(coef_het) %>%
++   group_by(model) %>%
++   summarise(
++     n = first(n),
++     r2 = first(r2),
++     adj_r2 = first(adj_r2),
++     .groups = "drop"
++   )
+> 
+> write_csv(reg_het_sum, OUT_REG_RESULTS_HET_CSV)
+
+[1mwrote[0m [32m2.15GB[0m in [36m 0s[0m, [32m2.15GB/s[0m
+                                                                              
+> write_csv(as_tibble(coef_het), OUT_REG_COEFS_HET_CSV)
+
+[1mwrote[0m [32m1.33kB[0m in [36m 0s[0m, [32m63.20MB/s[0m
+                                                                              
+[1mwrote[0m [32m2.15GB[0m in [36m 0s[0m, [32m2.15GB/s[0m
+                                                                              
+> if (!file.exists(OUT_REG_RESULTS_HET_CSV)) stop("CSV not created: ", OUT_REG_RESULTS_HET_CSV)
+> if (!file.exists(OUT_REG_COEFS_HET_CSV)) stop("CSV not created: ", OUT_REG_COEFS_HET_CSV)
+> 
+> het_plot <- extract_term_rows(coef_het, terms = c("dli2_q_mean")) %>%
++   mutate(term = "DLI (quarterly mean, t)")
+> 
+> p_het <- ggplot(het_plot, aes(x = model, y = estimate)) +
++   geom_hline(yintercept = 0, linewidth = 0.6, alpha = 0.6) +
++   geom_point(size = 2) +
++   geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi), width = 0.15, linewidth = 0.7) +
++   coord_flip() +
++   labs(
++     title = "Mechanism test: DLI effect on households vs professionals (Newey-West 95% CI)",
++     x = NULL, y = "Coefficient on DLI"
++   )
+> 
+> ggsave(FIG_COEF_HET, p_het, width = 10.5, height = 5.5, dpi = 300)
+> 
+> message("\nAll done. Outputs:")
+
+All done. Outputs:
+> message(" - Daily DLI CSV: ", OUT_DLI_DAILY_CSV)
+ - Daily DLI CSV: C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/fomc_dli_daily.csv
+> message(" - Quarterly DLI CSV: ", OUT_DLI_QUARTERLY_CSV)
+ - Quarterly DLI CSV: C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/fomc_dli_quarterly.csv
+> message(" - Surprises CSV: ", OUT_SURPRISES_Q_CSV)
+ - Surprises CSV: C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/fomc_surprises_quarterly.csv
+> message(" - Panel CSV: ", OUT_PANEL_QUARTERLY)
+ - Panel CSV: C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/panel_quarterly_dli_michigan_spf.csv
+> message(" - Baseline regs: ", OUT_REG_RESULTS_CSV, " and ", OUT_REG_COEFS_CSV)
+ - Baseline regs: C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/reg_results_seminar.csv and C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/reg_coefs_seminar.csv
+> message(" - Surprise regs: ", OUT_REG_RESULTS_SURP_CSV, " and ", OUT_REG_COEFS_SURP_CSV)
+ - Surprise regs: C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/reg_results_seminar_with_surprises.csv and C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/reg_coefs_seminar_with_surprises.csv
+> if (RUN_SHOCK) message(" - Shock coefs: ", OUT_REG_COEFS_SHOCK_CSV)
+ - Shock coefs: C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/reg_coefs_shock.csv
+> message(" - Heterogeneity regs: ", OUT_REG_RESULTS_HET_CSV, " and ", OUT_REG_COEFS_HET_CSV)
+ - Heterogeneity regs: C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/reg_results_heterogeneity_michigan_vs_spf.csv and C:/Users/eduar/Desktop/Arquivos Eduardo/PRINCIPAIS DOCUMENTOS/PHD HSG/Macroeconomics/Seminar paper/reg_coefs_heterogeneity_michigan_vs_spf.csv
+> 
+> 
