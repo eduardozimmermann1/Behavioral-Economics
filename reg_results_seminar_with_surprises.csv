@@ -1,0 +1,5 @@
+model,n,r2,adj_r2
+s1: households + monetary surprise (post-2020),24,0.7099234355841754,0.6488546851808439
+s2: households + |monetary surprise| (post-2020),24,0.7150117338004371,0.6550142040742134
+s3: households + statement & press surprises (post-2020),24,0.7100320013312186,0.6294853350343349
+s4: Δ expectations + monetary surprise (post-2020),24,0.018340566382881507,-0.12890834865968626
